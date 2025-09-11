@@ -41,7 +41,7 @@ class ApiService {
   }
 
   public async checkHealth(): Promise<any> {
-    const response = await this.axiosInstance.get('/healthz');
+    const response = await this.axiosInstance.get('/health');
     return response.data;
   }
 }

@@ -5,6 +5,8 @@ export interface AppConfig {
   apiBaseUrl: string;
   authority: string;
   redirectUri: string;
+  simpleUsername?: string;
+  simplePassword?: string;
 }
 
 export interface Product {

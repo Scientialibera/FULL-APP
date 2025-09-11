@@ -4,5 +4,7 @@
   "apiAudience": "__API_AUDIENCE__",
   "apiBaseUrl": "__API_BASE_URL__",
   "authority": "__AUTHORITY__",
-  "redirectUri": "__REDIRECT_URI__"
+  "redirectUri": "__REDIRECT_URI__",
+  "simpleUsername": "__SIMPLE_USERNAME__",
+  "simplePassword": "__SIMPLE_PASSWORD__"
 }

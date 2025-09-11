@@ -96,15 +96,21 @@ function New-SqlDatabaseUser {
 
     # SQL script to create user and assign permissions
     $sqlScript = @"
+-- Create managed identity user
 IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = '$ManagedIdentityName')
 BEGIN
     CREATE USER [$ManagedIdentityName] FROM EXTERNAL PROVIDER;
     ALTER ROLE db_datareader ADD MEMBER [$ManagedIdentityName];
     ALTER ROLE db_datawriter ADD MEMBER [$ManagedIdentityName];
     ALTER ROLE db_ddladmin ADD MEMBER [$ManagedIdentityName];
+    PRINT 'User $ManagedIdentityName created and permissions granted';
+END
+ELSE
+BEGIN
+    PRINT 'User $ManagedIdentityName already exists';
 END
 
--- Create sample table and data for testing
+-- Create products table for testing
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='products' AND xtype='U')
 BEGIN
     CREATE TABLE products (
@@ -119,16 +125,46 @@ BEGIN
     ('Sample Product 1', 'This is a sample product for testing', 29.99),
     ('Sample Product 2', 'Another sample product', 49.99),
     ('Sample Product 3', 'Third sample product', 19.99);
+    
+    PRINT 'Products table created and sample data inserted';
+END
+ELSE
+BEGIN
+    PRINT 'Products table already exists';
+END
+
+-- Create users table for demo authentication
+IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' AND xtype='U')
+BEGIN
+    CREATE TABLE users (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        username NVARCHAR(255) NOT NULL UNIQUE,
+        display_name NVARCHAR(255),
+        email NVARCHAR(255),
+        created_at DATETIME2 DEFAULT GETDATE()
+    );
+    
+    INSERT INTO users (username, display_name, email) VALUES 
+    ('demo', 'Demo User', 'demo@example.com'),
+    ('testuser', 'Test User', 'test@example.com');
+    
+    PRINT 'Users table created and sample data inserted';
+END
+ELSE
+BEGIN
+    PRINT 'Users table already exists';
 END
 "@
 
     # Execute SQL using AAD token with retries for AAD propagation
-    $maxRetries = 6
-    $delay = 15
+    $maxRetries = 10  # Increased from 6 to 10
+    $delay = 30       # Increased initial delay
     $success = $false
     
     for ($i = 1; $i -le $maxRetries -and -not $success; $i++) {
         try {
+            Write-Host "Attempting SQL user creation (attempt $i/$maxRetries)..." -ForegroundColor White
+            
             # Get AAD access token
             $accessToken = az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
             if (-not $accessToken) { throw "Failed to get access token" }
@@ -136,25 +172,30 @@ END
             # Execute SQL using .NET SqlClient
             Add-Type -AssemblyName System.Data
             $conn = New-Object System.Data.SqlClient.SqlConnection
-            $conn.ConnectionString = "Server=tcp:$SqlServerName.database.windows.net,1433;Database=$SqlDatabaseName;Encrypt=True;TrustServerCertificate=False;"
+            $conn.ConnectionString = "Server=tcp:$SqlServerName.database.windows.net,1433;Database=$SqlDatabaseName;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;"
             $conn.AccessToken = $accessToken
             $conn.Open()
             try {
                 $cmd = $conn.CreateCommand()
-                $cmd.CommandTimeout = 90
+                $cmd.CommandTimeout = 120  # Increased timeout
                 $cmd.CommandText = $sqlScript
-                $null = $cmd.ExecuteNonQuery()
+                $result = $cmd.ExecuteNonQuery()
                 $success = $true
-                Write-Host "✓ SQL Database user created/ensured (attempt $i)" -ForegroundColor Green
+                Write-Host "✓ SQL Database user created/ensured successfully (attempt $i)" -ForegroundColor Green
+                Write-Host "  SQL commands executed: $result" -ForegroundColor DarkGray
             } finally {
                 $conn.Close()
                 $conn.Dispose()
             }
         } catch {
-            Write-Warning "Attempt $i failed (likely AAD propagation). Waiting $delay seconds... Details: $($_.Exception.Message)"
+            $errorMessage = $_.Exception.Message
+            Write-Warning "Attempt $i failed. Error: $errorMessage"
             if ($i -lt $maxRetries) {
+                Write-Host "Waiting $delay seconds before retry..." -ForegroundColor Yellow
                 Start-Sleep -Seconds $delay
-                $delay = [Math]::Min($delay * 2, 120)
+                $delay = [Math]::Min($delay + 30, 180)  # Progressive backoff, max 3 minutes
+            } else {
+                Write-Error "All attempts failed. Last error: $errorMessage"
             }
         }
     }
@@ -168,12 +209,15 @@ END
     }
 
     if (-not $success) {
-        Write-Warning "Failed to create SQL Database user after $maxRetries attempts"
-        Write-Host "You may need to create the database user manually:" -ForegroundColor Yellow
-        Write-Host $sqlScript -ForegroundColor Yellow
+        Write-Warning "❌ Failed to create SQL Database user after $maxRetries attempts"
+        Write-Host "⚠️  SQL Database connection will not work until managed identity user is created manually" -ForegroundColor Yellow
+        Write-Host "📋 You can create the user manually by running this SQL script:" -ForegroundColor Yellow
+        Write-Host $sqlScript -ForegroundColor Cyan
+        Write-Host "💡 Or re-run the deployment script to retry" -ForegroundColor Yellow
         return $false
     }
     
+    Write-Host "✅ SQL Database user and sample data setup completed successfully" -ForegroundColor Green
     return $true
 }
 
@@ -247,9 +291,11 @@ if (-not (Test-ResourceGroup -ResourceGroupName $ResourceGroupName)) {
 
 # Create User-Assigned Managed Identity
 Write-Host "Creating User-Assigned Managed Identity: $ManagedIdentityName" -ForegroundColor Yellow
+$managedIdentityCreated = $false
 if (-not (Test-AzResource -ResourceName $ManagedIdentityName -ResourceType "Microsoft.ManagedIdentity/userAssignedIdentities" -ResourceGroup $ResourceGroupName)) {
     az identity create --resource-group $ResourceGroupName --name $ManagedIdentityName --location $Location --output none
     Write-Host "Managed Identity created" -ForegroundColor Green
+    $managedIdentityCreated = $true
 } else {
     Write-Host "Managed Identity already exists" -ForegroundColor Green
 }
@@ -259,6 +305,12 @@ $managedIdentity = az identity show --resource-group $ResourceGroupName --name $
 $managedIdentityId = $managedIdentity.id
 $managedIdentityClientId = $managedIdentity.clientId
 $managedIdentityPrincipalId = $managedIdentity.principalId
+
+# Wait for managed identity propagation if newly created
+if ($managedIdentityCreated) {
+    Write-Host "Waiting for managed identity propagation..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 60
+}
 
 # Create Container Registry
 Write-Host "Creating Container Registry: $RegistryName" -ForegroundColor Yellow
@@ -330,12 +382,14 @@ az sql server firewall-rule create --resource-group $ResourceGroupName --server 
 
 # Create SQL Database
 Write-Host "Creating SQL Database: $SqlDatabaseName" -ForegroundColor Yellow
+$sqlDatabaseCreated = $false
 $existingSqlDb = az sql db show --resource-group $ResourceGroupName --server $SqlServerName --name $SqlDatabaseName 2>$null
 if (-not $existingSqlDb) {
     az sql db create --resource-group $ResourceGroupName --server $SqlServerName --name $SqlDatabaseName --service-objective S0 --output none
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "SQL Database created" -ForegroundColor Green
+        $sqlDatabaseCreated = $true
     } else {
         Write-Error "Failed to create SQL database with exit code $LASTEXITCODE"
         exit 1
@@ -344,7 +398,15 @@ if (-not $existingSqlDb) {
     Write-Host "SQL Database already exists" -ForegroundColor Green
 }
 
-# Create database user for managed identity
+# Wait for SQL Database to be fully ready
+if ($sqlDatabaseCreated) {
+    Write-Host "Waiting for SQL Database to be fully ready..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 30
+}
+
+# Create database user for managed identity (with additional wait to ensure propagation)
+Write-Host "Waiting for Azure AD propagation before creating SQL user..." -ForegroundColor Yellow
+Start-Sleep -Seconds 30
 $userCreationSuccess = New-SqlDatabaseUser -SqlServerName $SqlServerName -SqlDatabaseName $SqlDatabaseName -ManagedIdentityName $ManagedIdentityName
 
 # Store SQL connection details in Key Vault if both SQL and Key Vault succeeded
@@ -490,7 +552,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Backend container built and pushed using ACR" -ForegroundColor Green
 
-# Create App Registrations for authentication
+# Configure Azure AD Authentication
 Write-Host "Creating Azure AD App Registrations..." -ForegroundColor Yellow
 
 # Create API App Registration
@@ -503,30 +565,46 @@ Write-Host "API App ID: $apiAppId" -ForegroundColor Green
 # Create SPA App Registration  
 $spaAppName = "SPA $AppName"
 Write-Host "Creating SPA App Registration: $spaAppName" -ForegroundColor White
-$spaApp = az ad app create --display-name $spaAppName --spa-redirect-uris "http://localhost:5173" --query "{appId:appId,id:id}" --output json | ConvertFrom-Json
+$spaApp = az ad app create --display-name $spaAppName --web-redirect-uris "http://localhost:5173" --query "{appId:appId,id:id}" --output json | ConvertFrom-Json
 $spaAppId = $spaApp.appId
 Write-Host "SPA App ID: $spaAppId" -ForegroundColor Green
 
+# Generate simple credentials for frontend simple login option
+Write-Host "Setting up simple login credentials for frontend..." -ForegroundColor Yellow
+$simpleUsername = "demo"
+$simplePassword = "demo123"
+
+Write-Host "Simple Login Credentials:" -ForegroundColor Green
+Write-Host "  Username: $simpleUsername" -ForegroundColor White
+Write-Host "  Password: $simplePassword" -ForegroundColor White
+Write-Host "  Note: These are for the simple login option in the frontend" -ForegroundColor Yellow
+
 # Configure API permissions for SPA to access API
 Write-Host "Configuring API permissions..." -ForegroundColor White
-$apiPermission = @{
-    "id" = $apiAppId
-    "type" = "Scope"
-} | ConvertTo-Json -Compress
-az ad app permission add --id $spaApp.id --api $apiAppId --api-permissions "User.Read"
+    $apiPermission = @{
+        "id" = $apiAppId
+        "type" = "Scope"
+    } | ConvertTo-Json -Compress
+    az ad app permission add --id $spaApp.id --api $apiAppId --api-permissions "User.Read"
 
-Write-Host "App Registrations created successfully" -ForegroundColor Green
+    $apiAudience = "api://$apiAppId"
+    $spaClientId = $spaAppId
+
+    Write-Host "App Registrations created successfully" -ForegroundColor Green
 
 # Create Container App
 Write-Host "Creating Container App: $ContainerAppName" -ForegroundColor Yellow
 if (-not (Test-AzResource -ResourceName $ContainerAppName -ResourceType "Microsoft.App/containerApps" -ResourceGroup $ResourceGroupName)) {
+    # Environment variables for Container App - Azure AD backend with simple login support
     $containerAppEnvVars = @(
         "TENANT_ID=$tenantId",
-        "API_AUDIENCE=api://$apiAppId",
+        "API_AUDIENCE=$apiAudience",
         "SQL_SERVER=$SqlServerName.database.windows.net",
         "SQL_DB=$SqlDatabaseName",
         "AZURE_CLIENT_ID=$managedIdentityClientId",
-        "PORT=8080"
+        "PORT=8080",
+        "SIMPLE_USERNAME=$simpleUsername",
+        "SIMPLE_PASSWORD=$simplePassword"
     )
     
     # Add Key Vault and Redis only if they were created successfully
@@ -546,14 +624,16 @@ if (-not (Test-AzResource -ResourceName $ContainerAppName -ResourceType "Microso
 } else {
     Write-Host "Container App already exists, updating environment variables..." -ForegroundColor Yellow
     
-    # Define the same environment variables for update
+    # Define the same environment variables for update - Azure AD backend with simple login support
     $containerAppEnvVars = @(
         "TENANT_ID=$tenantId",
         "API_AUDIENCE=api://$apiAppId",
         "SQL_SERVER=$SqlServerName.database.windows.net",
         "SQL_DB=$SqlDatabaseName",
         "AZURE_CLIENT_ID=$managedIdentityClientId",
-        "PORT=8080"
+        "PORT=8080",
+        "SIMPLE_USERNAME=$simpleUsername",
+        "SIMPLE_PASSWORD=$simplePassword"
     )
     
     # Add Key Vault and Redis only if they were created successfully
@@ -687,7 +767,7 @@ Write-Host "Static Web App URL: $actualSwaUrl" -ForegroundColor Green
 # Update SPA app registration with correct redirect URI
 Write-Host "Updating SPA app registration with correct redirect URI..." -ForegroundColor Yellow
 $updatedRedirectUris = @("http://localhost:5173", $actualSwaUrl)
-az ad app update --id $spaApp.id --spa-redirect-uris $updatedRedirectUris
+az ad app update --id $spaApp.id --web-redirect-uris $updatedRedirectUris
 Write-Host "SPA redirect URI updated" -ForegroundColor Green
 
 # Update frontend configuration file with real values
@@ -695,10 +775,12 @@ Write-Host "Updating frontend configuration..." -ForegroundColor Yellow
 $frontendConfig = @{
     tenantId = $tenantId
     spaClientId = $spaAppId
-    apiAudience = "api://$AppName-api"
+    apiAudience = "api://$apiAppId"
     apiBaseUrl = $apiBaseUrl
     authority = "https://login.microsoftonline.com/$tenantId"
     redirectUri = $actualSwaUrl
+    simpleUsername = $simpleUsername
+    simplePassword = $simplePassword
 } | ConvertTo-Json -Depth 10
 
 # Update the config file in the dist folder and redeploy
@@ -743,16 +825,24 @@ Write-Host "`nDeployment Summary:" -ForegroundColor Cyan
 Write-Host "SPA URL: $actualSwaUrl" -ForegroundColor White
 Write-Host "API FQDN: $apiBaseUrl" -ForegroundColor White
 Write-Host "Tenant ID: $tenantId" -ForegroundColor White
-Write-Host "SPA Client ID: $spaAppId" -ForegroundColor White
-Write-Host "API App ID: $apiAppId" -ForegroundColor White
-Write-Host "Scope: api://$apiAppId/user_impersonation" -ForegroundColor White
+Write-Host "SPA Client ID: $spaClientId" -ForegroundColor White
+Write-Host "API Audience: $apiAudience" -ForegroundColor White
 Write-Host "SQL Server: $SqlServerName.database.windows.net" -ForegroundColor White
 Write-Host "SQL Database: $SqlDatabaseName" -ForegroundColor White
 Write-Host "Key Vault: $KeyVaultName" -ForegroundColor White
 Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor White
+Write-Host "API App ID: $apiAppId" -ForegroundColor White
+Write-Host "Scope: api://$apiAppId/user_impersonation" -ForegroundColor White
+
+Write-Host "`n*** AUTHENTICATION OPTIONS ***" -ForegroundColor Green
+Write-Host "Azure AD Login: Sign in with your Microsoft account" -ForegroundColor White
+Write-Host "Simple Login Credentials:" -ForegroundColor Yellow
+Write-Host "  Username: $simpleUsername" -ForegroundColor White
+Write-Host "  Password: $simplePassword" -ForegroundColor White
 
 Write-Host "`nTest your application:" -ForegroundColor Yellow
 Write-Host "1. Visit: $actualSwaUrl" -ForegroundColor White
-Write-Host "2. Sign in with your Microsoft account" -ForegroundColor White
+Write-Host "2. Choose either Azure AD login or Simple login" -ForegroundColor White
 Write-Host "3. Test the API integration" -ForegroundColor White
+
 Write-Host "`nAll resources created successfully!" -ForegroundColor Green
