@@ -1,0 +1,8 @@
+{
+  "tenantId": "__TENANT_ID__",
+  "spaClientId": "__SPA_CLIENT_ID__", 
+  "apiAudience": "__API_AUDIENCE__",
+  "apiBaseUrl": "__API_BASE_URL__",
+  "authority": "__AUTHORITY__",
+  "redirectUri": "__REDIRECT_URI__"
+}
