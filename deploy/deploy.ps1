@@ -13,17 +13,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$AppName,
     
-    [Parameter(Mandif ($LASTEXITCODE -eq 0) {
-    Write-Host "Frontend deployed to Static Web App successfully" -ForegroundColor Green
-} else {
-    Write-Error "Frontend deployment failed"
-    Set-Location $PSScriptRoot
-    exit 1
-}
-
-# Get the actual Static Web App URL and update configuration
-$swaInfo = az staticwebapp show --resource-group $ResourceGroupName --name $StaticWebAppName | ConvertFrom-Json
-$actualSwaUrl = "https://$($swaInfo.properties.defaultHostname)"true)]
+    [Parameter(Mandatory = $true)]
     [string]$Location,
     
     [Parameter(Mandatory = $false)]
@@ -686,6 +676,8 @@ if ($LASTEXITCODE -eq 0) {
     Write-Error "Frontend deployment failed"
     Set-Location $PSScriptRoot
     exit 1
+}
+
 # Get the actual Static Web App URL and update configuration
 $swaInfo = az staticwebapp show --resource-group $ResourceGroupName --name $StaticWebAppName | ConvertFrom-Json
 $actualSwaUrl = "https://$($swaInfo.properties.defaultHostname)"
