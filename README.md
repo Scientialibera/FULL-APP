@@ -37,7 +37,7 @@ cd FULL-APP
 az login
 
 # Deploy everything
-.\deploy\deploy.ps1 -AppName "myapp" -Location "eastus"
+.\deploy\deploy.ps1 -AppName "myapp" -Location "westus2"
 ```
 
 ### What Gets Created
