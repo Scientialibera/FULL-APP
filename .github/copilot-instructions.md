@@ -1,0 +1,7 @@
+- After you are done with the code, do not summarize what you did.
+- Never use emojis in your code.
+- Inline code comments should not be trivial or obvious.
+- Never use emojis in your code.
+- Never use emojis in your code.
+- Never use emojis in your code.
+- THINK VERY VERY HARD BEFORE ANSWERRING

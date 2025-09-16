@@ -52,16 +52,16 @@ After successful deployment, you'll see:
 Deployment completed successfully!
 
 Deployment Summary:
-SPA URL: https://swa-myapp-1234.azurestaticapps.net
-API FQDN: https://ca-myapp.kindwave-12345678.eastus.azurecontainerapps.io
+SPA URL: https://swa-myapp1234.azurestaticapps.net
+API FQDN: https://camyapp.kindwave12345678.eastus.azurecontainerapps.io
 Tenant ID: your-tenant-id
 SPA Client ID: your-spa-client-id
 API App ID: your-api-client-id
 Scope: api://your-api-client-id/user_impersonation
 SQL Server: sql-myapp-1234.database.windows.net
 SQL Database: sqldb-myapp
-Key Vault: kv-myapp-1234
-Resource Group: rg-myapp
+Key Vault: kvmyapp1234
+Resource Group: rgmyapp
 ```
 
 ### 6. Test Your Application
@@ -105,7 +105,7 @@ To remove all resources:
 
 ```bash
 # Delete the resource group (removes all resources)
-az group delete --name "rg-myapp" --yes --no-wait
+az group delete --name "rgmyapp" --yes --no-wait
 ```
 
 ## Architecture Overview

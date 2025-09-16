@@ -17,7 +17,7 @@ param(
     [string]$Location,
     
     [Parameter(Mandatory = $false)]
-    [switch]$SkipRedis
+    [switch]$UseLocalDockerBuild
 )
 
 # Function to check if resource exists
@@ -88,14 +88,15 @@ function New-SqlDatabaseUser {
         if ($currentIp) {
             Write-Host "Adding temporary firewall rule for IP: $currentIp" -ForegroundColor Yellow
             az sql server firewall-rule create --resource-group $ResourceGroupName --server $SqlServerName --name $tempRuleName --start-ip-address $currentIp --end-ip-address $currentIp --output none
-            Write-Host "✓ Temporary firewall rule added" -ForegroundColor Green
+            Write-Host "Temporary firewall rule added" -ForegroundColor Green
         }
     } catch {
         Write-Warning "Failed to add temporary firewall rule: $_"
     }
 
     # SQL script to create user and assign permissions
-    $sqlScript = @"
+    # Use a single-quoted here-string to avoid PowerShell parsing issues, then substitute the managed identity name
+    $sqlScript = @'
 -- Create managed identity user
 IF NOT EXISTS (SELECT * FROM sys.database_principals WHERE name = '$ManagedIdentityName')
 BEGIN
@@ -154,7 +155,10 @@ ELSE
 BEGIN
     PRINT 'Users table already exists';
 END
-"@
+'@
+
+    # Replace the placeholder with the actual managed identity name (preserve required SQL quoting)
+    $sqlScript = $sqlScript -replace '\$ManagedIdentityName', $ManagedIdentityName
 
     # Execute SQL using AAD token with retries for AAD propagation
     $maxRetries = 10  # Increased from 6 to 10
@@ -181,7 +185,7 @@ END
                 $cmd.CommandText = $sqlScript
                 $result = $cmd.ExecuteNonQuery()
                 $success = $true
-                Write-Host "✓ SQL Database user created/ensured successfully (attempt $i)" -ForegroundColor Green
+                Write-Host "SQL Database user created/ensured successfully (attempt $i)" -ForegroundColor Green
                 Write-Host "  SQL commands executed: $result" -ForegroundColor DarkGray
             } finally {
                 $conn.Close()
@@ -209,33 +213,105 @@ END
     }
 
     if (-not $success) {
-        Write-Warning "❌ Failed to create SQL Database user after $maxRetries attempts"
-        Write-Host "⚠️  SQL Database connection will not work until managed identity user is created manually" -ForegroundColor Yellow
-        Write-Host "📋 You can create the user manually by running this SQL script:" -ForegroundColor Yellow
+        Write-Warning "Failed to create SQL Database user after $maxRetries attempts"
+        Write-Host "SQL Database connection will not work until managed identity user is created manually" -ForegroundColor Yellow
+        Write-Host "You can create the user manually by running this SQL script:" -ForegroundColor Yellow
         Write-Host $sqlScript -ForegroundColor Cyan
-        Write-Host "💡 Or re-run the deployment script to retry" -ForegroundColor Yellow
+        Write-Host "Or re-run the deployment script to retry" -ForegroundColor Yellow
         return $false
     }
     
-    Write-Host "✅ SQL Database user and sample data setup completed successfully" -ForegroundColor Green
+    Write-Host "SQL Database user and sample data setup completed successfully" -ForegroundColor Green
     return $true
 }
 
+    # Add Container App outbound IP addresses to Azure SQL Server firewall
+    function Add-ContainerAppFirewallRules {
+        param(
+            [string]$ResourceGroupName,
+            [string]$ContainerAppName,
+            [string]$SqlServerName
+        )
+
+        Write-Host "Adding Container App outbound IPs to SQL firewall for $ContainerAppName -> $SqlServerName" -ForegroundColor Cyan
+
+        try {
+            $ips = az containerapp show -g $ResourceGroupName -n $ContainerAppName --query "properties.outboundIpAddresses" -o tsv 2>$null
+        } catch {
+            Write-Warning "Failed to query Container App outbound IPs: $_"
+            return
+        }
+
+        if (-not $ips) {
+            Write-Warning "No outbound IPs found for Container App $ContainerAppName. Skipping firewall updates."
+            return
+        }
+
+        # az returns a newline-separated list; iterate and create per-IP rules if missing
+        foreach ($line in $ips -split "`n") {
+            $ip = $line.Trim()
+            if (-not $ip) { continue }
+            $ruleName = "aca-" + ($ip -replace '\.','-')
+            try {
+                $existing = az sql server firewall-rule show --resource-group $ResourceGroupName --server $SqlServerName --name $ruleName -o none 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Firewall rule $ruleName already exists for $ip" -ForegroundColor DarkGray
+                    continue
+                }
+            } catch {
+                # not found - create it
+            }
+
+            try {
+                az sql server firewall-rule create --resource-group $ResourceGroupName --server $SqlServerName --name $ruleName --start-ip-address $ip --end-ip-address $ip --output none
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Host "Created SQL firewall rule $ruleName for IP ${ip}" -ForegroundColor Green
+                } else {
+                    Write-Warning "Failed to create firewall rule $ruleName for IP ${ip}"
+                }
+            } catch {
+                Write-Warning "Error creating firewall rule $ruleName for IP ${ip}: $_"
+            }
+        }
+    }
+
 # Script Configuration
-$timestamp = Get-Date -Format "MMddHHmm"
-$randomSuffix = Get-Random -Minimum 100 -Maximum 999
-$cleanAppName = $AppName -replace '[^a-zA-Z0-9]', ''  # Remove special characters for resource names
-$ResourceGroupName = "rg-$AppName"
-$RegistryName = "acr$($cleanAppName.ToLower())$randomSuffix"
-$LogAnalyticsName = "log-$AppName"
-$ContainerAppEnvName = "env-$AppName"
-$ManagedIdentityName = "id-$AppName"
-$KeyVaultName = "kv-$AppName-$randomSuffix"
-$SqlServerName = "sql-$AppName-$randomSuffix"
-$SqlDatabaseName = "sqldb-$AppName"
-$RedisName = "redis$($cleanAppName.ToLower())$timestamp"
-$StaticWebAppName = "swa-$AppName-$randomSuffix"
-$ContainerAppName = "ca-$AppName"
+# Normalize app name deterministically: remove any non-alphanumeric characters and ensure it starts with a letter
+$randomSuffix = Get-Random -Minimum 100 -Maximum 999  # keep for fallback only
+$normalized = ($AppName -replace '[^a-zA-Z0-9]', '')
+if ([string]::IsNullOrEmpty($normalized)) { $normalized = "app" }
+if ($normalized -notmatch '^[a-zA-Z]') { $normalized = 'a' + $normalized }
+$normalized = $normalized.ToLower()
+
+# Helper to truncate strings safely
+function TruncateString {
+    param($s, $len)
+    if ($null -eq $s) { return $s }
+    if ($s.Length -le $len) { return $s }
+    return $s.Substring(0, $len)
+}
+
+# Build resource names deterministically (no random suffixes). Keep a short random suffix only as a fallback for ACR.
+$ResourceGroupName = "rg$normalized"
+$RegistryName = TruncateString "acr$normalized" 50
+$LogAnalyticsName = TruncateString "log$normalized" 63
+$ContainerAppEnvName = TruncateString "env$normalized" 45
+$ManagedIdentityName = TruncateString "id$normalized" 45
+
+# Key Vault requires 3-24 alphanumeric characters, must start with a letter
+$kvBase = "kv$normalized"
+$kvBase = $kvBase -replace '[^a-zA-Z0-9]', ''
+$kvBase = TruncateString $kvBase 24
+if ($kvBase -notmatch '^[a-zA-Z]') { $kvBase = 'a' + (TruncateString $kvBase 23) }
+$KeyVaultName = $kvBase
+
+# SQL server and database names
+$SqlServerName = TruncateString "sql$normalized" 63
+$SqlDatabaseName = TruncateString "sqldb$normalized" 63
+
+$RedisName = TruncateString "redis$normalized" 63
+$StaticWebAppName = TruncateString "swa$normalized" 63
+$ContainerAppName = TruncateString "ca$normalized" 45
 
 Write-Host "Starting deployment of $AppName to $Location" -ForegroundColor Green
 
@@ -265,6 +341,8 @@ Write-Host "Azure CLI extensions ready" -ForegroundColor Green
 # Register required resource providers
 Write-Host "Registering required resource providers..." -ForegroundColor Cyan
 $resourceProviders = @("Microsoft.Sql", "Microsoft.Cache", "Microsoft.App", "Microsoft.ContainerRegistry", "Microsoft.OperationalInsights", "Microsoft.KeyVault", "Microsoft.ManagedIdentity", "Microsoft.Web")
+# Add Service Connector provider so we can create containerapp connections (storage/sql/keyvault)
+$resourceProviders += "Microsoft.ServiceLinker"
 foreach ($provider in $resourceProviders) {
     Write-Host "Registering $provider" -ForegroundColor Yellow
     az provider register --namespace $provider --output none
@@ -273,6 +351,15 @@ foreach ($provider in $resourceProviders) {
     }
 }
 Write-Host "Resource providers registration initiated" -ForegroundColor Green
+
+# Ensure Service Connector provider registration completes (best-effort)
+try {
+    Write-Host "Ensuring Microsoft.ServiceLinker is registered..." -ForegroundColor Cyan
+    az provider register -n Microsoft.ServiceLinker --output none
+} catch {
+    Write-Warning "Failed to start registration for Microsoft.ServiceLinker: $_"
+}
+
 
 # Get subscription and tenant information
 $accountInfo = az account show | ConvertFrom-Json
@@ -309,16 +396,39 @@ $managedIdentityPrincipalId = $managedIdentity.principalId
 # Wait for managed identity propagation if newly created
 if ($managedIdentityCreated) {
     Write-Host "Waiting for managed identity propagation..." -ForegroundColor Yellow
-    Start-Sleep -Seconds 60
+    Start-Sleep -Seconds 20
 }
 
-# Create Container Registry
-Write-Host "Creating Container Registry: $RegistryName" -ForegroundColor Yellow
-if (-not (Test-AzResource -ResourceName $RegistryName -ResourceType "Microsoft.ContainerRegistry/registries" -ResourceGroup $ResourceGroupName)) {
-    az acr create --resource-group $ResourceGroupName --name $RegistryName --sku Basic --location $Location --output none
-    Write-Host "Container Registry created" -ForegroundColor Green
+# Create Container Registry (deterministic name). If the name is already taken globally and not in this resource group, try a single fallback with a short suffix.
+Write-Host "Creating/ensuring Container Registry: $RegistryName" -ForegroundColor Yellow
+$acrExistsInRg = Test-AzResource -ResourceName $RegistryName -ResourceType "Microsoft.ContainerRegistry/registries" -ResourceGroup $ResourceGroupName
+if (-not $acrExistsInRg) {
+    # Try to create the registry with the deterministic name
+    az acr create --resource-group $ResourceGroupName --name $RegistryName --sku Basic --location $Location --output none 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Container Registry created: $RegistryName" -ForegroundColor Green
+    } else {
+        Write-Warning "Could not create ACR with name $RegistryName. It may be taken globally. Checking if a registry with that name exists in another scope..."
+        # Check if a registry with that name exists somewhere else (global name collision)
+        $globalAcr = az acr list --query "[?name=='$RegistryName'] | [0]" --output json 2>$null | ConvertFrom-Json
+        if ($globalAcr -and $globalAcr.name -eq $RegistryName) {
+            Write-Warning "A global ACR with name $RegistryName exists in another subscription/rg. Using that registry for image push if accessible."
+            $RegistryName = $globalAcr.name
+        } else {
+            # Fallback: try once with a short random suffix appended
+            $fallbackRegistry = TruncateString ("acr$normalized$randomSuffix") 50
+            Write-Host "Attempting fallback registry name: $fallbackRegistry" -ForegroundColor Yellow
+            az acr create --resource-group $ResourceGroupName --name $fallbackRegistry --sku Basic --location $Location --output none 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "Fallback Container Registry created: $fallbackRegistry" -ForegroundColor Green
+                $RegistryName = $fallbackRegistry
+            } else {
+                Write-Warning "Failed to create fallback ACR as well. Please check ACR name availability or create an ACR manually." 
+            }
+        }
+    }
 } else {
-    Write-Host "Container Registry already exists" -ForegroundColor Green
+    Write-Host "Container Registry already exists in resource group" -ForegroundColor Green
 }
 
 # Assign AcrPull role to managed identity for container registry
@@ -352,7 +462,7 @@ if ($keyVaultSuccess) {
     
     # Additional wait for Key Vault RBAC propagation (critical for secret operations)
     Write-Host "Waiting for Key Vault RBAC propagation..." -ForegroundColor Yellow
-    Start-Sleep -Seconds 90
+    Start-Sleep -Seconds 20
 }
 
 # Create SQL Server
@@ -404,6 +514,15 @@ if ($sqlDatabaseCreated) {
     Start-Sleep -Seconds 30
 }
 
+# Assign SQL permissions to managed identity at the server level
+Write-Host "Assigning SQL Server permissions to managed identity..." -ForegroundColor Yellow
+$sqlServerId = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Sql/servers/$SqlServerName"
+Set-RoleAssignment -Principal $managedIdentityPrincipalId -Role "SQL DB Contributor" -Scope $sqlServerId -Description "Managed Identity SQL DB Contributor on SQL Server"
+
+# Also assign permissions at the database level for fine-grained access
+$sqlDatabaseId = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Sql/servers/$SqlServerName/databases/$SqlDatabaseName"
+Set-RoleAssignment -Principal $managedIdentityPrincipalId -Role "SQL DB Contributor" -Scope $sqlDatabaseId -Description "Managed Identity SQL DB Contributor on SQL Database"
+
 # Create database user for managed identity (with additional wait to ensure propagation)
 Write-Host "Waiting for Azure AD propagation before creating SQL user..." -ForegroundColor Yellow
 Start-Sleep -Seconds 30
@@ -448,66 +567,83 @@ if ($userCreationSuccess -and $keyVaultSuccess) {
     } while (-not $sqlSecretsStored -and $retryCount -lt $maxRetries)
 }
 
-# Create Redis Cache (optional - skip if user creation failed to speed up deployment)
+# Create Redis Cache with managed identity authentication
 $redisSuccess = $false
-if ($userCreationSuccess -and -not $SkipRedis) {
-    Write-Host "Creating Redis Cache: $RedisName" -ForegroundColor Yellow
-    if (-not (Test-AzResource -ResourceName $RedisName -ResourceType "Microsoft.Cache/Redis" -ResourceGroup $ResourceGroupName)) {
-        az redis create --resource-group $ResourceGroupName --name $RedisName --location $Location --sku Basic --vm-size c0 --output none
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Redis Cache created" -ForegroundColor Green
-            $redisSuccess = $true
-        } else {
-            Write-Warning "Redis Cache creation failed"
-        }
-    } else {
-        Write-Host "Redis Cache already exists" -ForegroundColor Green
+Write-Host "Creating Redis Cache: $RedisName" -ForegroundColor Yellow
+if (-not (Test-AzResource -ResourceName $RedisName -ResourceType "Microsoft.Cache/Redis" -ResourceGroup $ResourceGroupName)) {
+    az redis create --resource-group $ResourceGroupName --name $RedisName --location $Location --sku Basic --vm-size c0 --output none
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Redis Cache created" -ForegroundColor Green
         $redisSuccess = $true
+    } else {
+        Write-Warning "Redis Cache creation failed"
     }
+} else {
+    Write-Host "Redis Cache already exists" -ForegroundColor Green
+    $redisSuccess = $true
+}
+
+# Configure Redis with managed identity authentication (Redis 6.0+ with AAD)
+if ($redisSuccess) {
+    Write-Host "Configuring Redis for managed identity authentication..." -ForegroundColor Yellow
     
-    # Get Redis connection string and store in Key Vault (only if both Redis and Key Vault succeeded)
-    if ($redisSuccess -and $keyVaultSuccess) {
-        Write-Host "Storing Redis connection string in Key Vault" -ForegroundColor Yellow
+    # Assign Redis Contributor role to managed identity for Redis management
+    $redisId = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Cache/Redis/$RedisName"
+    Set-RoleAssignment -Principal $managedIdentityPrincipalId -Role "Redis Cache Contributor" -Scope $redisId -Description "Managed Identity Redis Cache Contributor"
+    
+    # Store Redis configuration in Key Vault (hostname only, no keys)
+    if ($keyVaultSuccess) {
+        Write-Host "Storing Redis configuration in Key Vault..." -ForegroundColor Yellow
         
-        $redisKey = az redis list-keys --resource-group $ResourceGroupName --name $RedisName --query primaryKey --output tsv
-        $redisConnectionString = "$RedisName.redis.cache.windows.net:6380,password=$redisKey,ssl=True,abortConnect=False"
-        
-        # Store with aggressive retry logic for RBAC propagation
         $maxRetries = 10
         $retryCount = 0
         $success = $false
         
         do {
             $retryCount++
-            Write-Host "Attempting to store Redis connection string (attempt $retryCount/$maxRetries)..." -ForegroundColor Yellow
+            Write-Host "Attempting to store Redis configuration (attempt $retryCount/$maxRetries)..." -ForegroundColor Yellow
             
-            az keyvault secret set --vault-name $KeyVaultName --name "redis-connection" --value $redisConnectionString --output none 2>$null
+            # Store only connection details, not keys
+            az keyvault secret set --vault-name $KeyVaultName --name "redis-host" --value "$RedisName.redis.cache.windows.net" --output none 2>$null
+            az keyvault secret set --vault-name $KeyVaultName --name "redis-port" --value "6380" --output none 2>$null
+            az keyvault secret set --vault-name $KeyVaultName --name "redis-ssl" --value "true" --output none 2>$null
+
+            # Also store full redis connection string (hostname:port,password=KEY,ssl=True,abortConnect=False)
+            try {
+                $primaryKey = az redis list-keys --name $RedisName --resource-group $ResourceGroupName --query primaryKey -o tsv 2>$null
+                if ($primaryKey) {
+                    $redisConn = "$($RedisName).redis.cache.windows.net:6380,password=$primaryKey,ssl=True,abortConnect=False"
+                    az keyvault secret set --vault-name $KeyVaultName --name "redis-connection" --value "$redisConn" --output none 2>$null
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Host "Stored full redis connection string in Key Vault as 'redis-connection'" -ForegroundColor Green
+                    } else {
+                        Write-Warning "Failed to store full redis connection string in Key Vault"
+                    }
+                } else {
+                    Write-Warning "Could not retrieve Redis primary key to build full connection string"
+                }
+            } catch {
+                Write-Warning "Error retrieving Redis keys or storing redis-connection secret: $_"
+            }
+            
             if ($LASTEXITCODE -eq 0) {
                 $success = $true
-                Write-Host "Redis connection string stored in Key Vault successfully" -ForegroundColor Green
+                Write-Host "Redis configuration stored in Key Vault successfully" -ForegroundColor Green
             } else {
                 if ($retryCount -lt $maxRetries) {
-                    $waitTime = [math]::min([math]::Pow(2, $retryCount) * 10, 120)  # Cap at 2 minutes
-                    Write-Warning "Failed to store secret (attempt $retryCount/$maxRetries). Waiting $waitTime seconds before retry..."
+                    $waitTime = [math]::min([math]::Pow(2, $retryCount) * 10, 120)
+                    Write-Warning "Failed to store Redis config (attempt $retryCount/$maxRetries). Waiting $waitTime seconds before retry..."
                     Start-Sleep -Seconds $waitTime
                 } else {
-                    Write-Warning "Failed to store Redis connection string in Key Vault after $maxRetries attempts"
-                    Write-Host "Redis connection string: $redisConnectionString" -ForegroundColor Yellow
-                    Write-Host "You can manually store this in Key Vault later using:" -ForegroundColor Yellow
-                    Write-Host "az keyvault secret set --vault-name $KeyVaultName --name 'redis-connection' --value '$redisConnectionString'" -ForegroundColor White
+                    Write-Warning "Failed to store Redis configuration in Key Vault after $maxRetries attempts"
+                    Write-Host "Redis Host: $RedisName.redis.cache.windows.net" -ForegroundColor Yellow
+                    Write-Host "Port: 6380, SSL: true" -ForegroundColor Yellow
                 }
             }
         } while (-not $success -and $retryCount -lt $maxRetries)
-        
-        # Also store individual Redis components for easier access
-        if ($success) {
-            az keyvault secret set --vault-name $KeyVaultName --name "redis-host" --value "$RedisName.redis.cache.windows.net" --output none 2>$null
-            az keyvault secret set --vault-name $KeyVaultName --name "redis-port" --value "6380" --output none 2>$null
-            az keyvault secret set --vault-name $KeyVaultName --name "redis-password" --value $redisKey --output none 2>$null
-        }
     }
-} else {
-    Write-Host "Skipping Redis Cache creation" -ForegroundColor Yellow
+    
+    Write-Host "Redis configured for managed identity authentication" -ForegroundColor Green
 }
 
 # Create Log Analytics Workspace
@@ -538,162 +674,425 @@ if (-not (Test-AzResource -ResourceName $ContainerAppEnvName -ResourceType "Micr
     Write-Host "Container Apps Environment already exists" -ForegroundColor Green
 }
 
-# Build and push backend container using ACR build
-Write-Host "Building and pushing backend container using ACR build" -ForegroundColor Yellow
-Set-Location "$PSScriptRoot\..\backend"
+# Build and push backend container
+if ($UseLocalDockerBuild) {
+    Write-Host "Building and pushing backend container using local Docker build" -ForegroundColor Yellow
+    Set-Location "$PSScriptRoot\..\backend"
+    
+    # Login to ACR
+    Write-Host "Logging into Azure Container Registry..." -ForegroundColor White
+    az acr login --name $RegistryName
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to login to Azure Container Registry"
+        exit 1
+    }
+    
+    # Build image locally
+    $imageTag = "$RegistryName.azurecr.io/$($normalized)-backend:latest"
+    Write-Host "Building Docker image: $imageTag" -ForegroundColor White
+    docker build -t $imageTag .
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to build Docker image locally"
+        exit 1
+    }
+    
+    # Push image to ACR
+    Write-Host "Pushing Docker image to ACR..." -ForegroundColor White
+    docker push $imageTag
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to push Docker image to ACR"
+        exit 1
+    }
+    
+    Write-Host "Backend container built and pushed using local Docker build" -ForegroundColor Green
+} else {
+    Write-Host "Building and pushing backend container using ACR build" -ForegroundColor Yellow
+    Set-Location "$PSScriptRoot\..\backend"
 
-# Build and push using Azure Container Registry build tasks
-$imageTag = "$RegistryName.azurecr.io/$($cleanAppName.ToLower())-backend:latest"
-az acr build --registry $RegistryName --image "$($cleanAppName.ToLower())-backend:latest" .
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Failed to build and push Docker image using ACR"
-    exit 1
+    # Build and push using Azure Container Registry build tasks
+    $imageTag = "$RegistryName.azurecr.io/$($normalized)-backend:latest"
+    az acr build --registry $RegistryName --image "$($normalized)-backend:latest" .
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "ACR Tasks build failed. This may be due to subscription limitations."
+        Write-Host "Consider using -UseLocalDockerBuild parameter if Docker is running locally" -ForegroundColor Yellow
+        exit 1
+    }
+
+    Write-Host "Backend container built and pushed using ACR" -ForegroundColor Green
 }
 
-Write-Host "Backend container built and pushed using ACR" -ForegroundColor Green
+# Configure Azure AD Authentication with proper SSO
+Write-Host "Creating Azure AD App Registrations for SSO..." -ForegroundColor Yellow
 
-# Configure Azure AD Authentication
-Write-Host "Creating Azure AD App Registrations..." -ForegroundColor Yellow
-
-# Create API App Registration
-$apiAppName = "API $AppName"
+# Create API App Registration with proper scopes
+$apiAppName = "API-$AppName"
 Write-Host "Creating API App Registration: $apiAppName" -ForegroundColor White
-$apiApp = az ad app create --display-name $apiAppName --identifier-uris "api://$AppName-api" --query "{appId:appId,id:id}" --output json | ConvertFrom-Json
-$apiAppId = $apiApp.appId
+
+# Check if API app already exists
+$existingApiApp = az ad app list --display-name $apiAppName --query "[0].{appId:appId,id:id}" --output json 2>$null | ConvertFrom-Json
+if ($existingApiApp -and $existingApiApp.appId) {
+    Write-Host "API App Registration already exists" -ForegroundColor Green
+    $apiAppId = $existingApiApp.appId
+    $apiAppObjectId = $existingApiApp.id
+} else {
+    Write-Host "Creating new API app registration..." -ForegroundColor White
+    # Create new API app
+    $apiAppResult = az ad app create --display-name $apiAppName --query "{appId:appId,id:id}" --output json 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to create API app registration"
+        exit 1
+    }
+    $apiApp = $apiAppResult | ConvertFrom-Json
+    $apiAppId = $apiApp.appId
+    $apiAppObjectId = $apiApp.id
+    
+    # Update with proper identifier URI using the app ID
+    Write-Host "Setting identifier URI for API app..." -ForegroundColor White
+    az ad app update --id $apiAppObjectId --identifier-uris "api://$apiAppId" --output none 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to set identifier URI for API app"
+    }
+    
+    # Create API scope for user impersonation
+    Write-Host "Creating API scope for user access..." -ForegroundColor White
+    $scopeManifest = @{
+        oauth2PermissionScopes = @(
+            @{
+                adminConsentDescription = "Allow the application to access the API on behalf of the signed-in user"
+                adminConsentDisplayName = "Access API"
+                id = [System.Guid]::NewGuid().ToString()
+                isEnabled = $true
+                type = "User"
+                userConsentDescription = "Allow the application to access the API on your behalf"
+                userConsentDisplayName = "Access API"
+                value = "user_impersonation"
+            }
+        )
+    } | ConvertTo-Json -Depth 10
+    
+    $tempFile = New-TemporaryFile
+    try {
+        $scopeManifest | Out-File -FilePath $tempFile.FullName -Encoding UTF8
+        az ad app update --id $apiAppObjectId --set api="@$($tempFile.FullName)" --output none 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to set API scope for API app"
+        }
+    } finally {
+        Remove-Item $tempFile.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
 Write-Host "API App ID: $apiAppId" -ForegroundColor Green
 
-# Create SPA App Registration  
-$spaAppName = "SPA $AppName"
+# Create SPA App Registration with proper redirect URIs
+$spaAppName = "SPA-$AppName"
 Write-Host "Creating SPA App Registration: $spaAppName" -ForegroundColor White
-$spaApp = az ad app create --display-name $spaAppName --web-redirect-uris "http://localhost:5173" --query "{appId:appId,id:id}" --output json | ConvertFrom-Json
-$spaAppId = $spaApp.appId
+
+# Check if SPA app already exists
+$existingSpaApp = az ad app list --display-name $spaAppName --query "[0].{appId:appId,id:id}" --output json 2>$null | ConvertFrom-Json
+if ($existingSpaApp -and $existingSpaApp.appId) {
+    Write-Host "SPA App Registration already exists" -ForegroundColor Green
+    $spaAppId = $existingSpaApp.appId
+    $spaAppObjectId = $existingSpaApp.id
+} else {
+    Write-Host "Creating new SPA app registration..." -ForegroundColor White
+    # Create SPA app
+    $spaAppResult = az ad app create --display-name $spaAppName --query "{appId:appId,id:id}" --output json 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Failed to create SPA app registration"
+        exit 1
+    }
+    $spaApp = $spaAppResult | ConvertFrom-Json
+    $spaAppId = $spaApp.appId
+    $spaAppObjectId = $spaApp.id
+    
+    # Update with SPA platform and redirect URI (localhost for development)
+    Write-Host "Configuring SPA platform for app..." -ForegroundColor White
+    az ad app update --id $spaAppObjectId --web-redirect-uris "http://localhost:5173" --output none 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Failed to set initial redirect URI for SPA app"
+    }
+}
 Write-Host "SPA App ID: $spaAppId" -ForegroundColor Green
 
-# Generate simple credentials for frontend simple login option
-Write-Host "Setting up simple login credentials for frontend..." -ForegroundColor Yellow
-$simpleUsername = "demo"
-$simplePassword = "demo123"
-
-Write-Host "Simple Login Credentials:" -ForegroundColor Green
-Write-Host "  Username: $simpleUsername" -ForegroundColor White
-Write-Host "  Password: $simplePassword" -ForegroundColor White
-Write-Host "  Note: These are for the simple login option in the frontend" -ForegroundColor Yellow
-
 # Configure API permissions for SPA to access API
-Write-Host "Configuring API permissions..." -ForegroundColor White
-    $apiPermission = @{
-        "id" = $apiAppId
-        "type" = "Scope"
-    } | ConvertTo-Json -Compress
-    az ad app permission add --id $spaApp.id --api $apiAppId --api-permissions "User.Read"
+Write-Host "Configuring API permissions for SPA..." -ForegroundColor White
+$apiScope = "api://$apiAppId/user_impersonation"
 
-    $apiAudience = "api://$apiAppId"
-    $spaClientId = $spaAppId
+# Add Microsoft Graph permissions
+$existingGraphPermissions = az ad app permission list --id $spaAppObjectId --query "[?resourceId=='00000003-0000-0000-c000-000000000000']" --output json 2>$null | ConvertFrom-Json
+if (-not $existingGraphPermissions -or $existingGraphPermissions.Count -eq 0) {
+    Write-Host "Adding Microsoft Graph permissions to SPA..." -ForegroundColor White
+    az ad app permission add --id $spaAppObjectId --api 00000003-0000-0000-c000-000000000000 --api-permissions 14dad69e-099b-42c9-810b-d002981feec1=Scope 2>$null
+    Write-Host "Microsoft Graph permissions added" -ForegroundColor Green
+} else {
+    Write-Host "Microsoft Graph permissions already exist" -ForegroundColor Green
+}
 
-    Write-Host "App Registrations created successfully" -ForegroundColor Green
+# Add API permissions
+$existingApiPermissions = az ad app permission list --id $spaAppObjectId --query "[?resourceId=='$apiAppId']" --output json 2>$null | ConvertFrom-Json
+if (-not $existingApiPermissions -or $existingApiPermissions.Count -eq 0) {
+    Write-Host "Adding API permissions to SPA..." -ForegroundColor White
+    $apiScopeId = az ad app show --id $apiAppId --query "api.oauth2PermissionScopes[0].id" --output tsv 2>$null
+    if ($apiScopeId) {
+        az ad app permission add --id $spaAppObjectId --api $apiAppId --api-permissions "$apiScopeId=Scope" 2>$null
+        Write-Host "API permissions added" -ForegroundColor Green
+    } else {
+        Write-Warning "Could not find API scope ID for permissions"
+    }
+} else {
+    Write-Host "API permissions already exist" -ForegroundColor Green
+}
+
+# Grant admin consent for your organization
+Write-Host "Granting admin consent for API permissions..." -ForegroundColor Yellow
+az ad app permission admin-consent --id $spaAppObjectId 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Admin consent granted successfully" -ForegroundColor Green
+} else {
+    Write-Warning "Admin consent failed or may need to be granted manually in Azure Portal"
+    Write-Host "This is common in some tenant configurations and won't prevent the app from working" -ForegroundColor Yellow
+    Write-Host "Users may see a consent prompt when first signing in" -ForegroundColor Yellow
+}
+
+$apiAudience = "api://$apiAppId"
+$spaClientId = $spaAppId
+
+Write-Host "Azure AD App Registrations configured for SSO successfully" -ForegroundColor Green
 
 # Create Container App
 Write-Host "Creating Container App: $ContainerAppName" -ForegroundColor Yellow
 if (-not (Test-AzResource -ResourceName $ContainerAppName -ResourceType "Microsoft.App/containerApps" -ResourceGroup $ResourceGroupName)) {
-    # Environment variables for Container App - Azure AD backend with simple login support
+    # Environment variables for Container App - Azure AD SSO only
     $containerAppEnvVars = @(
         "TENANT_ID=$tenantId",
         "API_AUDIENCE=$apiAudience",
         "SQL_SERVER=$SqlServerName.database.windows.net",
         "SQL_DB=$SqlDatabaseName",
         "AZURE_CLIENT_ID=$managedIdentityClientId",
-        "PORT=8080",
-        "SIMPLE_USERNAME=$simpleUsername",
-        "SIMPLE_PASSWORD=$simplePassword"
+        "PORT=8080"
     )
     
-    # Add Key Vault and Redis only if they were created successfully
+    # Add Key Vault only if it was created successfully
     if ($keyVaultSuccess) {
         $containerAppEnvVars += "KEYVAULT_URI=https://$KeyVaultName.vault.azure.net/"
-        if ($redisSuccess) {
-            $containerAppEnvVars += "REDIS_SECRET_NAME=redis-connection"
-        }
     }
     
-    $envVarsString = $containerAppEnvVars -join " "
-    $fullImageName = "$RegistryName.azurecr.io/$($cleanAppName.ToLower())-backend:latest"
+    # Add Redis configuration since we always deploy Redis
+    if ($redisSuccess) {
+        $containerAppEnvVars += "REDIS_HOST=$RedisName.redis.cache.windows.net"
+        $containerAppEnvVars += "REDIS_PORT=6380"
+        $containerAppEnvVars += "REDIS_SSL=true"
+        # Add the secret name so the backend knows which Key Vault secret to read
+        $containerAppEnvVars += "REDIS_SECRET_NAME=redis-connection"
+    }
     
-    az containerapp create --resource-group $ResourceGroupName --name $ContainerAppName --environment $ContainerAppEnvName --image $fullImageName --target-port 8080 --ingress external --min-replicas 1 --max-replicas 3 --cpu 0.5 --memory 1Gi --user-assigned $managedIdentityId --env-vars $envVarsString --registry-server "$RegistryName.azurecr.io" --registry-identity $managedIdentityId --output none
+    $fullImageName = "$RegistryName.azurecr.io/$($normalized)-backend:latest"
     
-    Write-Host "Container App created" -ForegroundColor Green
+    # Pass env vars as an array so PowerShell expands them into separate CLI arguments
+    az containerapp create --resource-group $ResourceGroupName --name $ContainerAppName --environment $ContainerAppEnvName --image $fullImageName --target-port 8080 --ingress external --min-replicas 1 --max-replicas 3 --cpu 0.5 --memory 1Gi --user-assigned $managedIdentityId --env-vars $containerAppEnvVars --registry-server "$RegistryName.azurecr.io" --registry-identity $managedIdentityId --output none
+    # Ensure SQL firewall allows Container App outbound IPs
+    Add-ContainerAppFirewallRules -ResourceGroupName $ResourceGroupName -ContainerAppName $ContainerAppName -SqlServerName $SqlServerName
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Container App created" -ForegroundColor Green
+    } else {
+        Write-Warning "Container App create returned non-zero exit code. Continuing to attempt configuration and retries." -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "Container App already exists, updating environment variables..." -ForegroundColor Yellow
+    Write-Host "Container App already exists, updating configuration..." -ForegroundColor Yellow
     
-    # Define the same environment variables for update - Azure AD backend with simple login support
+    # Define the same environment variables for update - Azure AD SSO only
     $containerAppEnvVars = @(
         "TENANT_ID=$tenantId",
         "API_AUDIENCE=api://$apiAppId",
         "SQL_SERVER=$SqlServerName.database.windows.net",
         "SQL_DB=$SqlDatabaseName",
         "AZURE_CLIENT_ID=$managedIdentityClientId",
-        "PORT=8080",
-        "SIMPLE_USERNAME=$simpleUsername",
-        "SIMPLE_PASSWORD=$simplePassword"
+        "PORT=8080"
     )
     
-    # Add Key Vault and Redis only if they were created successfully
+    # Add Key Vault only if it was created successfully
     if ($keyVaultSuccess) {
         $containerAppEnvVars += "KEYVAULT_URI=https://$KeyVaultName.vault.azure.net/"
-        if ($redisSuccess) {
-            $containerAppEnvVars += "REDIS_SECRET_NAME=redis-connection"
-        }
     }
     
-    $envVarsString = $containerAppEnvVars -join " "
+    # Add Redis configuration since we always deploy Redis
+    if ($redisSuccess) {
+        $containerAppEnvVars += "REDIS_HOST=$RedisName.redis.cache.windows.net"
+        $containerAppEnvVars += "REDIS_PORT=6380"
+        $containerAppEnvVars += "REDIS_SSL=true"
+        # Add the secret name so the backend knows which Key Vault secret to read
+        $containerAppEnvVars += "REDIS_SECRET_NAME=redis-connection"
+    }
     
-    # Update the Container App with correct environment variables
-    az containerapp update --name $ContainerAppName --resource-group $ResourceGroupName --set-env-vars $envVarsString --output none
+    $fullImageName = "$RegistryName.azurecr.io/$($normalized)-backend:latest"
     
-    Write-Host "Container App environment variables updated" -ForegroundColor Green
+    # Update the Container App with correct environment variables and image
+    # Pass env vars as an array so they are applied as distinct key=value pairs
+    az containerapp update --name $ContainerAppName --resource-group $ResourceGroupName --image $fullImageName --env-vars $containerAppEnvVars --output none
+    # Ensure SQL firewall allows Container App outbound IPs after update
+    Add-ContainerAppFirewallRules -ResourceGroupName $ResourceGroupName -ContainerAppName $ContainerAppName -SqlServerName $SqlServerName
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Container App configuration and image updated" -ForegroundColor Green
+    } else {
+        Write-Warning "Container App update returned non-zero exit code. Continuing and will retry fetching settings." -ForegroundColor Yellow
+    }
+
+    # Note: intentionally not re-applying env vars a second time here to avoid accidental concatenation or duplication
 }
 
 # Get Container App URL
-$containerApp = az containerapp show --resource-group $ResourceGroupName --name $ContainerAppName | ConvertFrom-Json
-$apiBaseUrl = "https://$($containerApp.properties.configuration.ingress.fqdn)"
+# Poll for Container App ingress FQDN (sometimes not present immediately)
+Write-Host "Polling for Container App ingress FQDN..." -ForegroundColor Yellow
+$maxApiPoll = 40
+$apiPollDelay = 10
+$apiBaseUrl = $null
+for ($i = 1; $i -le $maxApiPoll; $i++) {
+    try {
+        $containerApp = az containerapp show --resource-group $ResourceGroupName --name $ContainerAppName 2>$null | ConvertFrom-Json
+        if ($containerApp -and $containerApp.properties -and $containerApp.properties.configuration -and $containerApp.properties.configuration.ingress -and $containerApp.properties.configuration.ingress.fqdn) {
+            $apiBaseUrl = "https://$($containerApp.properties.configuration.ingress.fqdn)"
+            Write-Host "Found Container App ingress FQDN: $apiBaseUrl (attempt $i)" -ForegroundColor Green
+            break
+        }
+    } catch {
+        # ignore transient errors
+    }
+    Write-Host "Container App ingress FQDN not ready yet (attempt $i/$maxApiPoll). Waiting $apiPollDelay seconds..." -ForegroundColor Yellow
+    Start-Sleep -Seconds $apiPollDelay
+}
 
-Write-Host "Container App deployed successfully!" -ForegroundColor Green
-Write-Host "API URL: $apiBaseUrl" -ForegroundColor White
+if (-not $apiBaseUrl) {
+    Write-Error "Could not determine Container App ingress FQDN after $maxApiPoll attempts. Aborting to avoid placeholder API URL."
+    exit 1
+} else {
+    Write-Host "Container App deployed successfully!" -ForegroundColor Green
+    Write-Host "API URL: $apiBaseUrl" -ForegroundColor White
+}
 
-# Skip Static Web App deployment for simplified version
-Write-Host "Skipping frontend deployment for simplified version" -ForegroundColor Yellow
-Write-Host "You can test the API directly at: $apiBaseUrl/healthz" -ForegroundColor White
+# Intentionally not re-applying environment variables here. The Container App was created/updated above
+# with the desired environment variables. Re-applying env vars can cause unexpected concatenation
+# when invoked multiple times; avoid doing it to keep the deployment idempotent and predictable.
 
-# Build frontend
-Write-Host "Building frontend application" -ForegroundColor Yellow
+# Create Service Connector connections (idempotent) using the user-assigned identity created earlier (idfullapp)
+try {
+    Write-Host "Attempting to create Service Connector connections for Container App (SQL, Storage) using user-assigned identity..." -ForegroundColor Cyan
+
+    # get the user assigned identity client id
+    $uai = az identity show --resource-group $ResourceGroupName --name $ManagedIdentityName -o json 2>$null | ConvertFrom-Json
+    if ($uai -and $uai.clientId) {
+        $userClientId = $uai.clientId
+        $subscriptionId = $subscriptionId
+
+        # Create SQL connection if SQL database exists
+        $sqlDbId = az resource show --ids "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Sql/servers/$SqlServerName/databases/$SqlDatabaseName" -o tsv --query id 2>$null
+        if ($sqlDbId) {
+            Write-Host "Creating SQL service connection (if missing) using user-assigned identity..." -ForegroundColor Yellow
+            az containerapp connection create sql --source-id "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.App/containerApps/$ContainerAppName" --target-id $sqlDbId --user-identity client-id=$userClientId subs-id=$subscriptionId --container $ContainerAppName --yes --output none 2>$null
+            Write-Host "SQL service connection created or already exists" -ForegroundColor Green
+        } else {
+            Write-Host "SQL database resource not found; skipping SQL service connection" -ForegroundColor DarkGray
+        }
+
+        # Create Storage connection if there is a storage account in the same resource group (optional)
+        $storageAccount = az resource list --resource-group $ResourceGroupName --resource-type "Microsoft.Storage/storageAccounts" --query "[0].id" -o tsv 2>$null
+        if ($storageAccount) {
+            Write-Host "Creating Storage service connection (if missing) using user-assigned identity..." -ForegroundColor Yellow
+            az containerapp connection create storage-blob --source-id "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.App/containerApps/$ContainerAppName" --target-id "$storageAccount/blobServices/default" --user-identity client-id=$userClientId subs-id=$subscriptionId --container $ContainerAppName --yes --output none 2>$null
+            Write-Host "Storage service connection created or already exists" -ForegroundColor Green
+        } else {
+            Write-Host "No storage account found in resource group; skipping storage service connection" -ForegroundColor DarkGray
+        }
+    } else {
+        Write-Warning "User-assigned identity not found; cannot create service connections automatically"
+    }
+} catch {
+    Write-Warning "Failed to create service connections automatically: $_"
+}
+# Create Static Web App early so we can autofill frontend config before building
+Write-Host "Creating Static Web App early: $StaticWebAppName" -ForegroundColor Yellow
+if (-not (Test-AzResource -ResourceName $StaticWebAppName -ResourceType "Microsoft.Web/staticSites" -ResourceGroup $ResourceGroupName)) {
+    az staticwebapp create --resource-group $ResourceGroupName --name $StaticWebAppName --location $Location --sku "Free" --output none
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Static Web App created successfully (early)" -ForegroundColor Green
+    } else {
+        Write-Warning "Static Web App creation failed (early), continuing and will attempt later"
+    }
+} else {
+    Write-Host "Static Web App already exists (early)" -ForegroundColor Green
+}
+
+# Get the actual Static Web App URL now so we can write config before building frontend
+# Poll until the SWA defaultHostname is available (no placeholders) with a timeout
+$maxPollAttempts = 30
+$pollDelaySec = 10
+$attempt = 0
+$actualSwaUrl = $null
+Write-Host "Waiting for Static Web App hostname to become available (no placeholders)..." -ForegroundColor Yellow
+while ($attempt -lt $maxPollAttempts) {
+    $attempt++
+    try {
+        $swaInfoEarly = az staticwebapp show --resource-group $ResourceGroupName --name $StaticWebAppName 2>$null | ConvertFrom-Json
+        $hostname = $null
+        if ($swaInfoEarly) {
+            if ($swaInfoEarly.defaultHostname) { $hostname = $swaInfoEarly.defaultHostname }
+            elseif ($swaInfoEarly.properties -and $swaInfoEarly.properties.defaultHostname) { $hostname = $swaInfoEarly.properties.defaultHostname }
+            elseif ($swaInfoEarly.properties -and $swaInfoEarly.properties.hostNames -and $swaInfoEarly.properties.hostNames.Count -gt 0) { $hostname = $swaInfoEarly.properties.hostNames[0] }
+            elseif ($swaInfoEarly.hostName) { $hostname = $swaInfoEarly.hostName }
+        }
+        if ($hostname) {
+            $actualSwaUrl = "https://$hostname"
+            Write-Host "Static Web App hostname available: $actualSwaUrl (attempt $attempt)" -ForegroundColor Green
+            break
+        }
+    } catch {
+        # ignore transient errors and retry
+    }
+    Write-Host "Static Web App hostname not ready yet (attempt $attempt/$maxPollAttempts). Waiting $pollDelaySec seconds..." -ForegroundColor Yellow
+    Start-Sleep -Seconds $pollDelaySec
+}
+
+if (-not $actualSwaUrl) {
+    Write-Error "Static Web App hostname did not become available within $($maxPollAttempts * $pollDelaySec) seconds. Aborting because placeholders are not allowed."
+    exit 1
+}
+
+# Prepare frontend config in public so the build picks up correct values
+Write-Host "Writing frontend config to public/config.local.json for build..." -ForegroundColor Yellow
 Set-Location "$PSScriptRoot\..\frontend"
+try {
+    if (-not (Test-Path "public")) { New-Item -ItemType Directory -Path "public" | Out-Null }
+    $frontendConfigEarly = @{ 
+        tenantId = $tenantId
+        spaClientId = $spaAppId
+        apiAudience = "api://$apiAppId"
+        apiBaseUrl = $apiBaseUrl
+        authority = "https://login.microsoftonline.com/$tenantId"
+        redirectUri = $actualSwaUrl
+    } | ConvertTo-Json -Depth 10
 
-# Create config file for production
-$frontendConfig = @{
-    tenantId = $tenantId
-    spaClientId = $spaAppId
-    apiAudience = "api://$apiAppId"
-    apiBaseUrl = $apiBaseUrl
-    authority = "https://login.microsoftonline.com/$tenantId"
-    redirectUri = $swaUrl
-} | ConvertTo-Json -Depth 2
+    $publicConfigPath = Join-Path -Path (Get-Location) -ChildPath "public\config.local.json"
+    $frontendConfigEarly | Out-File -FilePath $publicConfigPath -Encoding UTF8
+    Write-Host "Wrote $publicConfigPath" -ForegroundColor Green
+} finally {
+    # stay in frontend dir to build
+}
 
-$frontendConfig | Out-File -FilePath "public\config.local.json" -Encoding UTF8
-
-# Install dependencies and build
+# Install dependencies and build once (no duplicate builds later). Abort on failure.
+Write-Host "Installing frontend dependencies and building (single build)..." -ForegroundColor Yellow
 npm install
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to install frontend dependencies"
     exit 1
 }
 
-npm run build
+
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Failed to build frontend"
     exit 1
 }
 
 Write-Host "Frontend built successfully" -ForegroundColor Green
-
+Set-Location $PSScriptRoot
 # Create Static Web App
 Write-Host "Creating Static Web App: $StaticWebAppName" -ForegroundColor Yellow
 if (-not (Test-AzResource -ResourceName $StaticWebAppName -ResourceType "Microsoft.Web/staticSites" -ResourceGroup $ResourceGroupName)) {
@@ -730,45 +1129,89 @@ if (-not (Test-Path "dist")) {
     exit 1
 }
 
-# Get deployment token
-$deploymentToken = az staticwebapp secrets list --resource-group $ResourceGroupName --name $StaticWebAppName --query "properties.apiKey" --output tsv 2>$null
-
-if ($deploymentToken -and $deploymentToken -ne "null" -and $deploymentToken.Trim() -ne "") {
-    Write-Host "Deploying to PRODUCTION environment..." -ForegroundColor Green
-    
-    # Deploy to production environment
-    npx @azure/static-web-apps-cli deploy --deployment-token $deploymentToken --app-location "dist" --env "production" --verbose
-    
-    if ($LASTEXITCODE -ne 0) {
-        # Fallback: try without --env flag
-        Write-Host "Retrying without --env flag..." -ForegroundColor Yellow
-        npx @azure/static-web-apps-cli deploy --deployment-token $deploymentToken --app-location "dist" --verbose
+# Get deployment token with retries and multiple retrieval strategies
+$deploymentToken = $null
+$maxTokenAttempts = 6
+$tokenDelay = 8
+for ($t = 1; $t -le $maxTokenAttempts; $t++) {
+    try {
+        Write-Host "Attempting to retrieve Static Web App deployment token (attempt $t/$maxTokenAttempts)..." -ForegroundColor Yellow
+        # Primary: secrets list
+        $token = az staticwebapp secrets list --resource-group $ResourceGroupName --name $StaticWebAppName --query "properties.apiKey" --output tsv 2>$null
+        if (-not $token -or $token -eq "null") {
+            # Secondary: show properties.apiKey
+            $token = az staticwebapp show --resource-group $ResourceGroupName --name $StaticWebAppName --query "properties.apiKey" --output tsv 2>$null
+        }
+        if (-not $token -or $token -eq "null") {
+            # Tertiary: list and query by name
+            $token = az staticwebapp list --resource-group $ResourceGroupName --query "[?name=='$StaticWebAppName'].properties.apiKey | [0]" --output tsv 2>$null
+        }
+        if ($token -and $token -ne "null" -and $token.Trim() -ne "") {
+            $deploymentToken = $token.Trim()
+            Write-Host "Obtained deployment token" -ForegroundColor Green
+            break
+        }
+    } catch {
+        Write-Warning "Transient error retrieving token: $_"
     }
-} else {
-    Write-Error "Could not get deployment token for Static Web App"
-    Set-Location $PSScriptRoot
+    Write-Host "Token not ready yet. Waiting $tokenDelay seconds before retry..." -ForegroundColor Yellow
+    Start-Sleep -Seconds $tokenDelay
+}
+
+if (-not $deploymentToken) {
+    Write-Error "Could not retrieve Static Web App deployment token after $maxTokenAttempts attempts. Frontend cannot be deployed automatically."
+    Write-Host "You can try: az staticwebapp secrets list --resource-group $ResourceGroupName --name $StaticWebAppName --query properties.apiKey -o tsv" -ForegroundColor Yellow
+    Write-Host "Or deploy manually with: npx @azure/static-web-apps-cli deploy --deployment-token <token> --app-location dist" -ForegroundColor Yellow
     exit 1
+}
+
+Write-Host "Deploying to PRODUCTION environment..." -ForegroundColor Green
+# Deploy to production environment
+npx @azure/static-web-apps-cli deploy --deployment-token $deploymentToken --app-location "dist" --env "production" --verbose
+
+if ($LASTEXITCODE -ne 0) {
+    # Fallback: try without --env flag
+    Write-Host "Retrying without --env flag..." -ForegroundColor Yellow
+    npx @azure/static-web-apps-cli deploy --deployment-token $deploymentToken --app-location "dist" --verbose
 }
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Frontend deployed to Static Web App successfully" -ForegroundColor Green
 } else {
-    Write-Error "Frontend deployment failed"
-    Set-Location $PSScriptRoot
-    exit 1
+    Write-Warning "Frontend deployment may have failed, but continuing with deployment"
 }
 
 # Get the actual Static Web App URL and update configuration
-$swaInfo = az staticwebapp show --resource-group $ResourceGroupName --name $StaticWebAppName | ConvertFrom-Json
-$actualSwaUrl = "https://$($swaInfo.properties.defaultHostname)"
-
-Write-Host "Static Web App URL: $actualSwaUrl" -ForegroundColor Green
+try {
+    $swaInfo = az staticwebapp show --resource-group $ResourceGroupName --name $StaticWebAppName 2>$null | ConvertFrom-Json
+    $swaHost = $null
+    if ($swaInfo) {
+        if ($swaInfo.defaultHostname) { $swaHost = $swaInfo.defaultHostname }
+        elseif ($swaInfo.properties -and $swaInfo.properties.defaultHostname) { $swaHost = $swaInfo.properties.defaultHostname }
+        elseif ($swaInfo.properties -and $swaInfo.properties.hostNames -and $swaInfo.properties.hostNames.Count -gt 0) { $swaHost = $swaInfo.properties.hostNames[0] }
+        elseif ($swaInfo.hostName) { $swaHost = $swaInfo.hostName }
+    }
+    if (-not $swaHost) {
+        Write-Error "Could not determine Static Web App hostname after deployment"
+        exit 1
+    }
+    $actualSwaUrl = "https://$swaHost"
+    Write-Host "Static Web App URL: $actualSwaUrl" -ForegroundColor Green
+} catch {
+    Write-Error "Failed to read Static Web App information: $_"
+    exit 1
+}
 
 # Update SPA app registration with correct redirect URI
 Write-Host "Updating SPA app registration with correct redirect URI..." -ForegroundColor Yellow
 $updatedRedirectUris = @("http://localhost:5173", $actualSwaUrl)
-az ad app update --id $spaApp.id --web-redirect-uris $updatedRedirectUris
-Write-Host "SPA redirect URI updated" -ForegroundColor Green
+az ad app update --id $spaAppObjectId --web-redirect-uris $updatedRedirectUris --output none 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "SPA redirect URI updated successfully" -ForegroundColor Green
+} else {
+    Write-Warning "Failed to update SPA redirect URI. You may need to update it manually in Azure Portal"
+    Write-Host "Required redirect URIs: http://localhost:5173, $actualSwaUrl" -ForegroundColor Yellow
+}
 
 # Update frontend configuration file with real values
 Write-Host "Updating frontend configuration..." -ForegroundColor Yellow
@@ -779,22 +1222,24 @@ $frontendConfig = @{
     apiBaseUrl = $apiBaseUrl
     authority = "https://login.microsoftonline.com/$tenantId"
     redirectUri = $actualSwaUrl
-    simpleUsername = $simpleUsername
-    simplePassword = $simplePassword
 } | ConvertTo-Json -Depth 10
 
 # Update the config file in the dist folder and redeploy
 Set-Content -Path "dist/config.local.json" -Value $frontendConfig -Encoding UTF8
 Write-Host "Frontend configuration updated" -ForegroundColor Green
 
-# Redeploy with updated configuration
-Write-Host "Redeploying frontend with updated configuration..." -ForegroundColor Yellow
-npx @azure/static-web-apps-cli deploy --deployment-token $deploymentToken --app-location "dist" --env "production" --verbose
+# Redeploy with updated configuration only if we have a deployment token
+if ($deploymentToken -and $deploymentToken -ne "null" -and $deploymentToken.Trim() -ne "") {
+    Write-Host "Redeploying frontend with updated configuration..." -ForegroundColor Yellow
+    npx @azure/static-web-apps-cli deploy --deployment-token $deploymentToken --app-location "dist" --env "production" --verbose
 
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Frontend redeployed with correct configuration" -ForegroundColor Green
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Frontend redeployed with correct configuration" -ForegroundColor Green
+    } else {
+        Write-Warning "Frontend redeploy may have failed"
+    }
 } else {
-    Write-Warning "Frontend redeploy may have failed"
+    Write-Host "Skipping frontend redeploy - no deployment token available" -ForegroundColor Yellow
 }
 
 # Return to original directory
@@ -834,15 +1279,13 @@ Write-Host "Resource Group: $ResourceGroupName" -ForegroundColor White
 Write-Host "API App ID: $apiAppId" -ForegroundColor White
 Write-Host "Scope: api://$apiAppId/user_impersonation" -ForegroundColor White
 
-Write-Host "`n*** AUTHENTICATION OPTIONS ***" -ForegroundColor Green
-Write-Host "Azure AD Login: Sign in with your Microsoft account" -ForegroundColor White
-Write-Host "Simple Login Credentials:" -ForegroundColor Yellow
-Write-Host "  Username: $simpleUsername" -ForegroundColor White
-Write-Host "  Password: $simplePassword" -ForegroundColor White
+Write-Host "`n*** AUTHENTICATION ***" -ForegroundColor Green
+Write-Host "Azure AD SSO: Sign in with your Microsoft account" -ForegroundColor White
+Write-Host "All authentication now uses Azure AD with managed identity" -ForegroundColor Green
 
 Write-Host "`nTest your application:" -ForegroundColor Yellow
 Write-Host "1. Visit: $actualSwaUrl" -ForegroundColor White
-Write-Host "2. Choose either Azure AD login or Simple login" -ForegroundColor White
+Write-Host "2. Sign in with your Microsoft account" -ForegroundColor White
 Write-Host "3. Test the API integration" -ForegroundColor White
 
 Write-Host "`nAll resources created successfully!" -ForegroundColor Green

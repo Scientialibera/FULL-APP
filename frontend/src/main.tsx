@@ -25,6 +25,16 @@ const initializeApp = async () => {
     // Initialize MSAL
     await msalInstance.initialize();
 
+    // Handle redirect response
+    try {
+      const response = await msalInstance.handleRedirectPromise();
+      if (response) {
+        console.log('Redirect response handled:', response);
+      }
+    } catch (error) {
+      console.error('Error handling redirect response:', error);
+    }
+
     const root = ReactDOM.createRoot(
       document.getElementById('root') as HTMLElement
     );

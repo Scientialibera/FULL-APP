@@ -44,17 +44,17 @@ az login
 
 The deployment script creates:
 
-1. **Resource Group**: `rg-{AppName}`
+1. **Resource Group**: `rg{AppName}`
 2. **Container Registry**: `acr{appname}{random}`
 3. **Log Analytics Workspace**: `log-{AppName}`
 4. **Container Apps Environment**: `env-{AppName}`
 5. **User-Assigned Managed Identity**: `id-{AppName}`
-6. **Key Vault**: `kv-{AppName}-{random}`
+6. **Key Vault**: `kv{AppName}{random}`
 7. **SQL Server**: `sql-{AppName}-{random}` (AAD-only auth)
 8. **SQL Database**: `sqldb-{AppName}`
 9. **Redis Cache**: `redis-{AppName}-{random}`
-10. **Static Web App**: `swa-{AppName}-{random}`
-11. **Container App**: `ca-{AppName}`
+10. **Static Web App**: `swa{AppName}{random}`
+11. **Container App**: `ca{AppName}`
 12. **Azure AD App Registrations**: `{AppName}-api` and `{AppName}-spa`
 
 ## Security Features
@@ -213,6 +213,95 @@ The script is designed to be run multiple times safely:
 - Maintains configuration consistency
 
 ## Monitoring & Troubleshooting
+
+## Service Connector (Microsoft.ServiceLinker) & Runtime Networking
+
+This project now uses Azure Service Connector (preview) to wire Container Apps to Azure services (SQL, Storage, Key Vault) using a user-assigned managed identity created by the deployment script (`id<appname>`).
+
+Key points:
+
+- The deploy script registers the `Microsoft.ServiceLinker` provider (if not already registered) and creates idempotent container app connections for supported services.
+- Service Connector provisions RBAC and injects configuration into the Container App so the app can use Managed Identity for authentication (no passwords in code).
+- The script creates a service connection for Azure SQL using your existing user-assigned identity (recommended) rather than creating a system-assigned identity.
+- The deployment also attempts to add the Container App outbound IP addresses to the Azure SQL server firewall so non‑VNet Container Apps can reach SQL. If you later move to a VNet-injected managed environment and Private Endpoints, update the script accordingly.
+
+Provider registration
+- Ensure `Microsoft.ServiceLinker` is registered in your subscription before creating connections (the deployment script will try to register it automatically):
+
+```powershell
+az provider register -n Microsoft.ServiceLinker
+az provider show -n Microsoft.ServiceLinker --query registrationState -o tsv
+```
+
+Create a Service Connector connection (CLI examples)
+- Using the user-assigned identity created by the deployment script (`id<appname>`). Replace placeholders as needed.
+
+```powershell
+# SQL (creates a Service Connector linking your container app to the SQL database using the user-assigned identity)
+$sourceId = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.App/containerApps/<app>"
+$targetSqlId = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Sql/servers/<sqlserver>/databases/<dbname>"
+az containerapp connection create sql --source-id $sourceId --target-id $targetSqlId --user-identity client-id=<uai-client-id> subs-id=<sub> --container <containerName> --yes
+
+# Storage (if you have a storage account)
+$targetStorage = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Storage/storageAccounts/<storage>/blobServices/default"
+az containerapp connection create storage-blob --source-id $sourceId --target-id $targetStorage --user-identity client-id=<uai-client-id> subs-id=<sub> --container <containerName> --yes
+```
+
+Notes on network and NSG rules
+- If your Container App managed environment is NOT VNet-injected (the default), NSGs on your subscription subnets will NOT filter ACA egress. Use Service Connector + SQL firewall rules or move to a VNet-injected environment for subnet-level control.
+- If you do use a VNet-injected environment, you can use NSG service tags (`Storage`, `Sql`, `SqlManagement`, `KeyVault`, etc.) to permit outbound access to those Azure services while denying other egress. The deployment script contains example NSG commands in the documentation section.
+
+Applying runtime env fixes without full redeploy
+- If you need to correct `SQL_SERVER` / `SQL_DB` on an existing Container App without rebuilding/pushing images, update the Container App environment and restart the app. Two approaches:
+
+- Simple CLI (preferred):
+
+```powershell
+az containerapp update --resource-group <rg> --name <app> --env-vars SQL_SERVER=<serverFqdn> SQL_DB=<dbname>
+# then force a restart by scaling to 0 and back to 1
+az containerapp update -g <rg> -n <app> --set template.scale.minReplicas=0 template.scale.maxReplicas=0
+Start-Sleep -s 10
+az containerapp update -g <rg> -n <app> --set template.scale.minReplicas=1 template.scale.maxReplicas=1
+```
+
+- Robust REST patch (works around CLI parsing issues):
+
+```powershell
+# 1) read the resource via az rest (include api-version)
+$sub = az account show --query id -o tsv
+$uri = "/subscriptions/$sub/resourceGroups/<rg>/providers/Microsoft.App/containerApps/<app>?api-version=2024-06-01"
+$ca = az rest --method get --uri $uri -o json | ConvertFrom-Json
+
+# 2) merge envs into $ca.properties.template.containers[0].env (preserve existing keys), then
+$body = @{ properties = @{ template = @{ containers = $ca.properties.template.containers } } } | ConvertTo-Json -Depth 10
+
+# 3) PATCH the resource
+az rest --method patch --uri $uri --body $body --headers "Content-Type=application/json"
+
+# 4) restart by scaling down/up (see above)
+```
+
+Verification commands
+
+```powershell
+# List service connections for a container app
+az containerapp connection list --resource-group <rg> --name <app> --output table
+
+# List SQL firewall rules
+az sql server firewall-rule list -g <rg> -s <sqlserver> -o table
+
+# Tail recent container app logs
+az containerapp logs show --resource-group <rg> --name <app> --tail 200
+
+# Check health endpoint
+$fqdn = az containerapp show -g <rg> -n <app> --query "properties.configuration.ingress.fqdn" -o tsv
+Invoke-WebRequest -Uri "https://$fqdn/health" -UseBasicParsing | Select-Object StatusCode, Content
+```
+
+Troubleshooting tips
+- If `az` returns transient connection reset errors locally, try executing the same commands in Azure Cloud Shell (browser) which has a stable CLI environment and required extensions.
+- If SQL connectivity still fails after env update and restart, verify the SQL server firewall includes the Container App outbound IPs (the deployment script attempts to add them using `Add-ContainerAppFirewallRules`) or consider enabling Private Endpoint and moving to a vNet-injected managed environment.
+
 
 ### Health Checks
 
